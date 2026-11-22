@@ -5,6 +5,58 @@
 
 ---
 
+## ⚡ 想直接看东西：下这个 exe（10MB，双击即开）
+
+```powershell
+irm https://github.com/Luzhen-0502/neural-fusion/releases/latest/download/install.ps1 | iex
+```
+
+桌面会出现「NF-1 架构检查器」，双击就能看：
+- 完整数据流：图像 → ViT → Merger → Connector → 主干 → GenHead → FLUX DiT → 图像
+- 每一层的输入/输出张量维度、参数量
+- 一键「形状验证」，9 项检查全过（纯数学，不联网、不用 GPU、不装 PyTorch）
+
+### ⚠️ 这个 exe 里**没有模型**
+
+| 有 | 没有 |
+|---|---|
+| 架构可视化 + 维度推导 | ❌ 任何模型权重 |
+| 9 项形状验证 | ❌ 聊天能力 |
+| 10MB，免安装 | ❌ 画图能力 |
+
+**为什么？** 三个底座模型合计约 **80GB**（GPT-OSS-20B ≈40GB bf16、Qwen2.5-VL ≈16GB、FLUX.1-Schnell ≈24GB），而且**融合后的 NF-1 权重还没训练出来**——训练需要 A100 级 GPU，本机跑不了。
+
+**「融合模型」不是下载来的，是训出来的。** 本仓库给的是「怎么搭 + 怎么训 + 怎么导出」的全套方案。
+
+---
+
+## 三类人怎么用
+
+| 你是 | 做什么 | 链接 |
+|---|---|---|
+| **只想看架构长啥样** | 跑上面那条命令，下 10MB 的检查器 | [Release](https://github.com/Luzhen-0502/neural-fusion/releases/latest) |
+| **想看代码/验证形状** | clone 仓库，`python shape_test.py` | 见下方 |
+| **想自己真训练** | 读 `docs/TRAINING.md`，准备云 GPU，从 HuggingFace 下三个底座 | 见「底座模型从哪来」 |
+
+### 底座模型从哪来（给了三步）
+
+```bash
+# 1) 装依赖（需要 Python 3.10+ 和 CUDA 环境）
+pip install torch transformers diffusers peft bitsandbytes accelerate datasets
+
+# 2) 下三个底座（合计约 80GB，必须自己下）
+huggingface-cli download openai/gpt-oss-20b                 --local-dir models/gpt-oss-20b
+huggingface-cli download Qwen/Qwen2.5-VL-7B-Instruct        --local-dir models/qwen2.5-vl
+huggingface-cli download black-forest-labs/FLUX.1-schnell   --local-dir models/flux-schnell
+
+# 3) 从 S1 阶段开始训（先只训 Connector，4090 就能跑）
+python src/train_qlora.py --stage S1 --data data/align.jsonl --out ckpt/s1
+```
+
+> 国内下载慢：`export HF_ENDPOINT=https://hf-mirror.com` 再执行上面的命令。
+
+---
+
 ## 这是什么
 
 不是「调三个模型的脚本」，而是**两处神经接线**：
