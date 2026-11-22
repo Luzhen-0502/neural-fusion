@@ -12,9 +12,15 @@ NF-1 架构检查器（Architecture Inspector）
 
 from __future__ import annotations
 
+import json
+import queue
+import threading
 import tkinter as tk
 from dataclasses import dataclass
-from tkinter import ttk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+from nf_downloader import MODELS, Downloader, find_curl, human
 
 FONT = "Microsoft YaHei UI"
 BG = "#0F172A"
@@ -25,6 +31,22 @@ ACCENT = "#38BDF8"
 GREEN = "#4ADE80"
 RED = "#F87171"
 AMBER = "#FBBF24"
+
+CONF_PATH = Path.home() / ".nf1_inspector.json"
+
+
+def load_conf() -> dict:
+    try:
+        return json.loads(CONF_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_conf(d: dict) -> None:
+    try:
+        CONF_PATH.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 # ===========================================================================
@@ -268,6 +290,11 @@ class App:
         tk.Label(top, text="GPT-OSS-20B + Qwen2.5-VL ViT + FLUX Schnell（DiT）",
                  font=(FONT, 10), bg=CARD, fg=SUB).pack(side=tk.LEFT, padx=14, pady=10)
 
+        tk.Button(top, text="⬇ 下载底座模型", font=(FONT, 10, "bold"),
+                  bg=GREEN, fg="#0B1220", relief=tk.FLAT, padx=14, pady=5,
+                  cursor="hand2", command=self._open_downloader)\
+            .pack(side=tk.RIGHT, padx=16, pady=12)
+
         # 左：层表
         left = tk.Frame(r, bg=BG)
         left.grid(row=1, column=0, sticky="nsew", padx=(12, 6), pady=10)
@@ -396,8 +423,225 @@ class App:
             text=f"{'全部通过' if allok else '有项未过'}  {okn}/{len(results)}",
             fg=GREEN if allok else RED)
 
+    def _open_downloader(self) -> None:
+        DownloadDialog(self.root)
+
     def run(self) -> None:
         self.root.mainloop()
+
+
+class DownloadDialog:
+    """底座模型下载窗口。
+
+    特点：
+      - 三个模型随便勾，只下你要的
+      - **下载目录可以自己选**，会记住上次选的
+      - 一个镜像连不上自动换下一个（hf-mirror → 官方）
+      - 断点续传：关掉再开还能接着下
+    """
+
+    def __init__(self, parent: tk.Tk) -> None:
+        self.win = tk.Toplevel(parent)
+        self.win.title("下载底座模型")
+        self.win.configure(bg=BG)
+        self.win.geometry("820x660")
+        self.win.transient(parent)
+        self.win.minsize(680, 520)
+
+        self.events: queue.Queue = queue.Queue()
+        self.dl = Downloader(self._emit)
+        self.vars: dict[str, tk.BooleanVar] = {}
+
+        conf = load_conf()
+        default_dir = conf.get("download_dir") or str(Path.home() / "NF-1-models")
+        self.out_var = tk.StringVar(value=default_dir)
+
+        self._build()
+
+        if not find_curl():
+            self._log("⚠ 没找到 curl.exe（Win10/11 自带；若缺失请先装系统更新）")
+
+        self.win.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.win.after(100, self._poll)
+
+    # ------------------------------------------------------------------
+    def _build(self) -> None:
+        w = self.win
+        w.grid_columnconfigure(0, weight=1)
+        w.grid_rowconfigure(3, weight=1)
+
+        # 标题
+        head = tk.Frame(w, bg=CARD)
+        head.grid(row=0, column=0, sticky="ew")
+        tk.Label(head, text="下载底座模型", font=(FONT, 14, "bold"),
+                 bg=CARD, fg=TEXT).pack(side=tk.LEFT, padx=16, pady=12)
+        tk.Label(head, text="合计约 80GB，建议磁盘至少留 100GB",
+                 font=(FONT, 9), bg=CARD, fg=SUB).pack(side=tk.LEFT, padx=6)
+        tk.Label(head, text="镜像：hf-mirror → 官方（自动切换）",
+                 font=(FONT, 9), bg=CARD, fg=GREEN).pack(side=tk.RIGHT, padx=16)
+
+        # 模型勾选
+        box = tk.Frame(w, bg=CARD)
+        box.grid(row=1, column=0, sticky="ew", padx=12, pady=(10, 6))
+        box.grid_columnconfigure(1, weight=1)
+        for i, m in enumerate(MODELS):
+            var = tk.BooleanVar(value=True)
+            self.vars[m.key] = var
+            tk.Checkbutton(box, variable=var, bg=CARD, activebackground=CARD,
+                           selectcolor="#0F172A", fg=TEXT, activeforeground=TEXT,
+                           font=(FONT, 10), text=m.title).grid(
+                row=i, column=0, sticky="w", padx=(10, 6), pady=4)
+            tk.Label(box, text=f"约 {m.approx_gb:.0f}GB · {m.note}",
+                     font=(FONT, 9), bg=CARD, fg=SUB).grid(
+                row=i, column=1, sticky="w", padx=6)
+            tk.Label(box, text=m.repo, font=(FONT, 9), bg=CARD, fg=ACCENT).grid(
+                row=i, column=2, sticky="e", padx=10)
+
+        # 下载目录（可自定义 + 记住）
+        drow = tk.Frame(w, bg=BG)
+        drow.grid(row=2, column=0, sticky="ew", padx=12, pady=6)
+        drow.grid_columnconfigure(1, weight=1)
+        tk.Label(drow, text="下载到：", font=(FONT, 10, "bold"),
+                 bg=BG, fg=TEXT).grid(row=0, column=0, sticky="w")
+        ent = tk.Entry(drow, textvariable=self.out_var, font=(FONT, 10),
+                       bg=CARD, fg=TEXT, insertbackground=TEXT, relief=tk.FLAT)
+        ent.grid(row=0, column=1, sticky="ew", padx=8, ipady=5)
+        tk.Button(drow, text="浏览…", font=(FONT, 10), bg="#334155", fg=TEXT,
+                  relief=tk.FLAT, padx=14, pady=5, cursor="hand2",
+                  command=self._pick_dir).grid(row=0, column=2)
+        tk.Button(drow, text="打开目录", font=(FONT, 9), bg="#334155", fg=TEXT,
+                  relief=tk.FLAT, padx=10, pady=5, cursor="hand2",
+                  command=self._open_dir).grid(row=0, column=3, padx=(6, 0))
+
+        # 日志
+        logf = tk.Frame(w, bg=CARD)
+        logf.grid(row=3, column=0, sticky="nsew", padx=12, pady=6)
+        logf.grid_rowconfigure(0, weight=1)
+        logf.grid_columnconfigure(0, weight=1)
+        self.log = tk.Text(logf, wrap=tk.WORD, font=("Consolas", 9), bg="#0B1220",
+                           fg="#CBD5E1", relief=tk.FLAT, padx=10, pady=8,
+                           state=tk.DISABLED)
+        sb = ttk.Scrollbar(logf, orient=tk.VERTICAL, command=self.log.yview)
+        self.log.configure(yscrollcommand=sb.set)
+        self.log.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+
+        # 底部：进度 + 按钮
+        foot = tk.Frame(w, bg=BG)
+        foot.grid(row=4, column=0, sticky="ew", padx=12, pady=(4, 12))
+        foot.grid_columnconfigure(0, weight=1)
+
+        self.pbar = ttk.Progressbar(foot, mode="determinate", maximum=100)
+        self.pbar.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+
+        self.status = tk.Label(foot, text="准备好，点「开始下载」", font=(FONT, 9),
+                               bg=BG, fg=SUB, anchor="w")
+        self.status.grid(row=1, column=0, sticky="w")
+
+        self.btn_start = tk.Button(foot, text="▶ 开始下载", font=(FONT, 11, "bold"),
+                                   bg=GREEN, fg="#0B1220", relief=tk.FLAT,
+                                   padx=22, pady=7, cursor="hand2", command=self._start)
+        self.btn_start.grid(row=1, column=1, padx=8)
+        self.btn_stop = tk.Button(foot, text="■ 停止", font=(FONT, 11), bg="#475569",
+                                  fg=TEXT, relief=tk.FLAT, padx=18, pady=7,
+                                  cursor="hand2", state=tk.DISABLED, command=self._stop)
+        self.btn_stop.grid(row=1, column=2)
+
+    # ------------------------------------------------------------------
+    def _pick_dir(self) -> None:
+        d = filedialog.askdirectory(title="选择模型保存目录",
+                                    initialdir=self.out_var.get() or str(Path.home()))
+        if d:
+            self.out_var.set(d)
+            conf = load_conf()
+            conf["download_dir"] = d
+            save_conf(conf)
+
+    def _open_dir(self) -> None:
+        p = Path(self.out_var.get())
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            __import__("os").startfile(str(p))
+        except Exception as e:  # noqa: BLE001
+            messagebox.showwarning("打不开", str(e))
+
+    def _start(self) -> None:
+        chosen = [k for k, v in self.vars.items() if v.get()]
+        if not chosen:
+            messagebox.showinfo("没选模型", "至少勾一个模型再开始。")
+            return
+        out = Path(self.out_var.get().strip())
+        if not str(out):
+            messagebox.showinfo("没选目录", "先选一个下载目录。")
+            return
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("目录不可用", f"{e}\n\n换一个目录试试。")
+            return
+        conf = load_conf()
+        conf["download_dir"] = str(out)
+        save_conf(conf)
+
+        self._log(f"开始下载 → {out}")
+        self.btn_start.configure(state=tk.DISABLED, bg="#475569")
+        self.btn_stop.configure(state=tk.NORMAL)
+        self.dl.start(chosen, out)
+
+    def _stop(self) -> None:
+        self.dl.stop()
+        self.status.configure(text="正在停止…")
+
+    def _on_close(self) -> None:
+        if self.dl.running():
+            if not messagebox.askyesno("还在下载", "现在关闭会停止下载（已下的部分保留，下次可续传）。确定关闭？"):
+                return
+            self.dl.stop()
+        self.win.destroy()
+
+    # ------------------------------------------------------------------
+    def _emit(self, kind: str, payload=None) -> None:
+        self.events.put((kind, payload))
+
+    def _log(self, text: str) -> None:
+        self.log.configure(state=tk.NORMAL)
+        self.log.insert(tk.END, text + "\n")
+        self.log.see(tk.END)
+        self.log.configure(state=tk.DISABLED)
+
+    def _poll(self) -> None:
+        try:
+            while True:
+                kind, payload = self.events.get_nowait()
+                self._handle(kind, payload)
+        except queue.Empty:
+            pass
+        if self.win.winfo_exists():
+            self.win.after(120, self._poll)
+
+    def _handle(self, kind: str, payload) -> None:
+        if kind == "dl_status":
+            self.status.configure(text=str(payload))
+        elif kind == "dl_log":
+            self._log(str(payload))
+        elif kind == "dl_progress":
+            idx, total, rel, size = payload
+            pct = (idx - 1) / total * 100 + (min(size, 1) / total) * 100 if total else 0
+            self.pbar.configure(value=min(99.0, pct))
+            self.status.configure(text=f"[{idx}/{total}] {rel}  （已下 {human(size)}）")
+        elif kind == "dl_done":
+            self.pbar.configure(value=100)
+            self.status.configure(text="全部下载完成 ✓")
+            self._log("全部完成 ✓")
+            self.btn_start.configure(state=tk.NORMAL, bg=GREEN)
+            self.btn_stop.configure(state=tk.DISABLED)
+            messagebox.showinfo("下载完成", f"模型已保存到：\n{payload}")
+        elif kind == "dl_error":
+            self._log(f"✗ {payload}")
+            self.status.configure(text="出错了")
+            self.btn_start.configure(state=tk.NORMAL, bg=GREEN)
+            self.btn_stop.configure(state=tk.DISABLED)
+            messagebox.showerror("下载失败", str(payload))
 
 
 if __name__ == "__main__":
